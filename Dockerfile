@@ -36,7 +36,7 @@ RUN grep -vE '^torch($|[<=>])' requirements.txt > /tmp/requirements.txt && \
 RUN pip install packaging psutil
 ENV MAX_JOBS=4
 ENV TORCH_CUDA_ARCH_LIST="9.0"
-RUN pip install flash-attn
+RUN pip install flash-attn --no-build-isolation
 
 COPY . /dynamic
 
