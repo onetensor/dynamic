@@ -3,8 +3,9 @@ FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-ARG TORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/cu126"
-ARG TORCH_VERSION=""
+# Use stable cu126 index, not nightly
+ARG TORCH_INDEX_URL="https://download.pytorch.org/whl/cu126"
+ARG TORCH_VERSION="2.9.1"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv python-is-python3 python3-dev\
@@ -22,21 +23,14 @@ COPY requirements.txt /dynamic/requirements.txt
 
 RUN python -m pip install --upgrade pip setuptools wheel
 
-RUN if [ -n "${TORCH_VERSION}" ]; then \
-      pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}" --upgrade; \
-    else \
-      pip install --pre torch --index-url "${TORCH_INDEX_URL}" --upgrade; \
-    fi
+RUN pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}" --upgrade
+
+ARG FLASH_ATTN_WHL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.5.4/flash_attn-2.8.3+cu126torch2.9-cp312-cp312-linux_x86_64.whl"
+RUN pip install --no-deps "${FLASH_ATTN_WHL}"
 
 RUN grep -vE '^torch($|[<=>])' requirements.txt > /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
-
-# Install FlashAttention (will use official wheel if available)
-RUN pip install packaging psutil
-ENV MAX_JOBS=20
-ENV TORCH_CUDA_ARCH_LIST="9.0"
-RUN pip install flash-attn --no-build-isolation
 
 COPY . /dynamic
 
