@@ -1577,6 +1577,8 @@ def compute_update_norm(params: list[Tensor], snapshot: list[Tensor]):
     return math.sqrt(total)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model_raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+model_is_compiled = model_raw is not model
 all_params = list(model.parameters())
 
 ########################################
@@ -1641,6 +1643,9 @@ for step in range(train_steps + 1):
         ws = new_ws
     ws_phase = new_phase
     if args.dropsoftmax_step >= 0 and step == args.dropsoftmax_step:
+        if model_is_compiled:
+            model = model_raw
+            model_is_compiled = False
         model.set_attn_impl(args.dropsoftmax_mode)
         current_attn_impl = args.dropsoftmax_mode
         print0("=== HARD DROP SOFTMAX NOW ===", console=True)
