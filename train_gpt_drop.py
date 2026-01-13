@@ -1393,6 +1393,7 @@ class Hyperparameters:
     train_batch_size: int = 2048 * 24 * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
+    val_linear_eval_steps: int = 16 # limit eval steps after drop to avoid long stalls; 0 uses full val_tokens
     # optimization
     num_iterations: int = 1670 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
@@ -1615,12 +1616,12 @@ del train_loader, initial_state
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 training_time_ms = 0
 # validation helper
-def eval_loss(ws_value: int):
-    assert args.val_tokens % args.val_batch_size == 0
-    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+def eval_loss(ws_value: int, *, val_tokens: int, val_batch_size: int):
+    val_tokens = max(val_tokens, val_batch_size)
+    val_steps = grad_accum_steps * val_tokens // val_batch_size
     val_loader = distributed_data_generator(
         args.val_files,
-        args.val_batch_size,
+        val_batch_size,
         -1,
         grad_accum_steps=grad_accum_steps,
         align_to_bos=False,
@@ -1639,6 +1640,7 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
+linear_eval_warned = False
 ws, ws_phase = get_ws_phase(0)
 current_attn_impl = "softmax"
 for step in range(train_steps + 1):
@@ -1662,12 +1664,28 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_loss_ctx = eval_loss(ws)
+        val_batch_size = args.val_batch_size
+        val_tokens = args.val_tokens
+        if current_attn_impl == "linear" and args.val_linear_eval_steps > 0:
+            val_batch_size = min(val_batch_size, args.train_batch_size)
+            val_tokens = val_batch_size * args.val_linear_eval_steps
+            if master_process and not linear_eval_warned:
+                print0(
+                    f"linear eval capped to {args.val_linear_eval_steps} steps "
+                    f"(val_tokens={val_tokens}, val_batch_size={val_batch_size})",
+                    console=True,
+                )
+                linear_eval_warned = True
+        val_loss_ctx = eval_loss(ws, val_tokens=val_tokens, val_batch_size=val_batch_size)
         val_loss_long = val_loss_ctx
         if ws != args.ws_validate:
             angular_backup = model.angular_freq.clone()
             model.apply_yarn(ws, args.ws_validate)
-            val_loss_long = eval_loss(args.ws_validate)
+            val_loss_long = eval_loss(
+                args.ws_validate,
+                val_tokens=val_tokens,
+                val_batch_size=val_batch_size,
+            )
             model.set_angular_freq(angular_backup)
         if master_process:
             print0(
