@@ -32,8 +32,11 @@ RUN grep -vE '^torch($|[<=>])' requirements.txt > /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
 
+# Install FlashAttention (will use official wheel if available)
 RUN pip install packaging psutil
-RUN pip install flash-attn --no-build-isolation
+ENV MAX_JOBS=4
+ENV TORCH_CUDA_ARCH_LIST="9.0"
+RUN pip install flash-attn
 
 COPY . /dynamic
 
