@@ -8,7 +8,7 @@ import copy
 import glob
 import math
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import lru_cache
 from itertools import accumulate
 from pathlib import Path
@@ -26,6 +26,12 @@ import triton.language as tl
 from flash_attn_interface import flash_attn_varlen_func
 import torch._dynamo as dynamo
 dynamo.config.recompile_limit = 64
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    WANDB_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -567,6 +573,150 @@ def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
+def _sample_tensor(x: Tensor, max_samples: int):
+    if max_samples <= 0:
+        return None
+    x_flat = x.reshape(-1)
+    if x_flat.numel() == 0:
+        return None
+    if x_flat.numel() <= max_samples:
+        return x_flat.detach()
+    idx = torch.randperm(x_flat.numel(), device=x_flat.device)[:max_samples]
+    return x_flat[idx].detach()
+
+class LinStatsAccumulator:
+    def __init__(self, *, eps: float, sample_size: int, collect_hist: bool):
+        self.eps = eps
+        self.sample_size = sample_size
+        self.collect_hist = collect_hist
+        self.den_min = float("inf")
+        self.den_sum = 0.0
+        self.den_count = 0
+        self.den_clamp_count = 0
+        self.S_norm_max = 0.0
+        self.Z_norm_max = 0.0
+        self.y_norm_max = 0.0
+        self.nan_inf_count = 0
+        self.den_samples: list[Tensor] = []
+        self.y_norm_samples: list[Tensor] = []
+
+    def update(self, den: Tensor, k_sum: Tensor, kv_sum: Tensor, y: Tensor):
+        den_flat = den.reshape(-1)
+        self.den_min = min(self.den_min, den_flat.min().item())
+        self.den_sum += den_flat.sum().item()
+        self.den_count += den_flat.numel()
+        self.den_clamp_count += (den_flat < self.eps).sum().item()
+        self.nan_inf_count += (~torch.isfinite(den_flat)).sum().item()
+        self.nan_inf_count += (~torch.isfinite(y)).sum().item()
+
+        z_norm = k_sum.float().norm(dim=-1).max().item()
+        s_norm = kv_sum.float().pow(2).sum(dim=(-1, -2)).sqrt().max().item()
+        y_norm = y.float().norm(dim=-1)
+        y_norm_max = y_norm.max().item()
+        self.Z_norm_max = max(self.Z_norm_max, z_norm)
+        self.S_norm_max = max(self.S_norm_max, s_norm)
+        self.y_norm_max = max(self.y_norm_max, y_norm_max)
+
+        if self.sample_size > 0:
+            den_sample = _sample_tensor(den_flat, self.sample_size)
+            if den_sample is not None:
+                self.den_samples.append(den_sample.cpu())
+            if self.collect_hist:
+                y_sample = _sample_tensor(y_norm.reshape(-1), self.sample_size)
+                if y_sample is not None:
+                    self.y_norm_samples.append(y_sample.cpu())
+
+    def finalize(self):
+        den_samples = torch.cat(self.den_samples) if self.den_samples else None
+        y_norm_samples = torch.cat(self.y_norm_samples) if self.y_norm_samples else None
+        return {
+            "den_min": 0.0 if self.den_count == 0 else self.den_min,
+            "den_sum": self.den_sum,
+            "den_count": self.den_count,
+            "den_clamp_count": self.den_clamp_count,
+            "S_norm_max": self.S_norm_max,
+            "Z_norm_max": self.Z_norm_max,
+            "y_norm_max": self.y_norm_max,
+            "nan_inf_count": self.nan_inf_count,
+            "den_samples": den_samples,
+            "y_norm_samples": y_norm_samples,
+        }
+
+class LinStatsCollector:
+    def __init__(self, *, sample_size: int, collect_hist: bool):
+        self.sample_size = sample_size
+        self.collect_hist = collect_hist
+        self.layer_stats: dict[int, dict] = {}
+        self.den_samples: list[Tensor] = []
+        self.y_norm_samples: list[Tensor] = []
+
+    def add_layer(self, layer_idx: int, stats: dict):
+        self.layer_stats[layer_idx] = stats
+        den_samples = stats.get("den_samples")
+        y_samples = stats.get("y_norm_samples")
+        if den_samples is not None:
+            self.den_samples.append(den_samples)
+        if y_samples is not None:
+            self.y_norm_samples.append(y_samples)
+
+    def _merge_samples(self, samples: list[Tensor]):
+        if not samples:
+            return None
+        merged = torch.cat(samples)
+        if merged.numel() > self.sample_size:
+            idx = torch.randperm(merged.numel())[: self.sample_size]
+            merged = merged[idx]
+        return merged
+
+    def aggregate(self):
+        if not self.layer_stats:
+            return {
+                "den_min": 0.0,
+                "den_mean": 0.0,
+                "den_p01": 0.0,
+                "den_clamp_frac": 0.0,
+                "S_norm_max": 0.0,
+                "Z_norm_max": 0.0,
+                "y_norm_max": 0.0,
+                "nan_inf_count": 0.0,
+                "den_samples": None,
+                "y_norm_samples": None,
+            }
+
+        den_min = min(s["den_min"] for s in self.layer_stats.values())
+        den_sum = sum(s["den_sum"] for s in self.layer_stats.values())
+        den_count = sum(s["den_count"] for s in self.layer_stats.values())
+        den_clamp_count = sum(s["den_clamp_count"] for s in self.layer_stats.values())
+        s_norm_max = max(s["S_norm_max"] for s in self.layer_stats.values())
+        z_norm_max = max(s["Z_norm_max"] for s in self.layer_stats.values())
+        y_norm_max = max(s["y_norm_max"] for s in self.layer_stats.values())
+        nan_inf_count = sum(s["nan_inf_count"] for s in self.layer_stats.values())
+
+        den_samples = self._merge_samples(self.den_samples)
+        y_norm_samples = self._merge_samples(self.y_norm_samples)
+        den_p01 = 0.0
+        if den_samples is not None and den_samples.numel() > 0:
+            den_p01 = torch.quantile(den_samples, 0.01).item()
+
+        den_mean = 0.0
+        den_clamp_frac = 0.0
+        if den_count > 0:
+            den_mean = den_sum / den_count
+            den_clamp_frac = den_clamp_count / den_count
+
+        return {
+            "den_min": den_min,
+            "den_mean": den_mean,
+            "den_p01": den_p01,
+            "den_clamp_frac": den_clamp_frac,
+            "S_norm_max": s_norm_max,
+            "Z_norm_max": z_norm_max,
+            "y_norm_max": y_norm_max,
+            "nan_inf_count": nan_inf_count,
+            "den_samples": den_samples,
+            "y_norm_samples": y_norm_samples,
+        }
+
 def _segment_positions(seqlens: Tensor, total_len: int):
     seqlens = seqlens.to(dtype=torch.int64)
     positions = torch.arange(total_len, device=seqlens.device, dtype=torch.int64)
@@ -606,6 +756,7 @@ def _linear_causal_attention_full(
     attn_scale: float,
     window_tokens: int | None = None,
     eps: float = 1e-6,
+    stats_accum: LinStatsAccumulator | None = None,
 ):
     positions, segment_start = _segment_positions(seqlens, q.size(0))
     q = q * attn_scale
@@ -617,7 +768,10 @@ def _linear_causal_attention_full(
     kv_cum = _segment_cumsum(kv, positions, segment_start, window_tokens=window_tokens)
     num = torch.einsum("thd,thdm->thm", q_fp32, kv_cum)
     den = torch.einsum("thd,thd->th", q_fp32, k_cum).unsqueeze(-1)
-    return (num / den.clamp_min(eps)).to(dtype=q.dtype)
+    y = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+    if stats_accum is not None:
+        stats_accum.update(den.squeeze(-1), k_cum, kv_cum, y)
+    return y
 
 def _iter_segments(seqlens: Tensor, total_len: int):
     seqlens = seqlens.to(dtype=torch.int64)
@@ -641,6 +795,7 @@ def _linear_attention_chunked_no_window(
     attn_scale: float,
     chunk_size: int,
     eps: float,
+    stats_accum: LinStatsAccumulator | None = None,
 ):
     out = torch.empty_like(v)
     k_prefix = torch.zeros((q.size(1), q.size(2)), dtype=torch.float32, device=q.device)
@@ -658,7 +813,10 @@ def _linear_attention_chunked_no_window(
         kv_cum = torch.cumsum(kv, dim=0, dtype=torch.float32) + kv_prefix
         num = torch.einsum("thd,thdm->thm", q_fp32, kv_cum)
         den = torch.einsum("thd,thd->th", q_fp32, k_cum).unsqueeze(-1)
-        out[s:e] = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+        y = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+        out[s:e] = y
+        if stats_accum is not None:
+            stats_accum.update(den.squeeze(-1), k_cum, kv_cum, y)
         k_prefix = k_cum[-1]
         kv_prefix = kv_cum[-1]
     return out
@@ -672,6 +830,7 @@ def _linear_attention_chunked_window(
     window_tokens: int,
     chunk_size: int,
     eps: float,
+    stats_accum: LinStatsAccumulator | None = None,
 ):
     total_len = q.size(0)
     num_chunks = (total_len + chunk_size - 1) // chunk_size
@@ -765,7 +924,10 @@ def _linear_attention_chunked_window(
 
         num = torch.einsum("thd,thdm->thm", q_fp32, sum_kv)
         den = torch.einsum("thd,thd->th", q_fp32, sum_k).unsqueeze(-1)
-        out[s:e] = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+        y = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+        out[s:e] = y
+        if stats_accum is not None:
+            stats_accum.update(den.squeeze(-1), sum_k, sum_kv, y)
     return out
 
 def linear_causal_attention(
@@ -778,6 +940,7 @@ def linear_causal_attention(
     window_tokens: int | None = None,
     eps: float = 1e-6,
     chunk_size: int | None = None,
+    stats_accum: LinStatsAccumulator | None = None,
 ):
     if chunk_size is None or chunk_size <= 0:
         return _linear_causal_attention_full(
@@ -788,6 +951,7 @@ def linear_causal_attention(
             attn_scale=attn_scale,
             window_tokens=window_tokens,
             eps=eps,
+            stats_accum=stats_accum,
         )
     out = torch.empty_like(v)
     for start, end in _iter_segments(seqlens, q.size(0)):
@@ -802,6 +966,7 @@ def linear_causal_attention(
                 attn_scale=attn_scale,
                 chunk_size=chunk_size,
                 eps=eps,
+                stats_accum=stats_accum,
             )
         else:
             out[start:end] = _linear_attention_chunked_window(
@@ -812,6 +977,7 @@ def linear_causal_attention(
                 window_tokens=window_tokens,
                 chunk_size=chunk_size,
                 eps=eps,
+                stats_accum=stats_accum,
             )
     return out
 
@@ -824,12 +990,14 @@ class AttnArgs:
     rotary_cos: torch.Tensor
     rotary_sin: torch.Tensor
     attn_scale: float
+    lin_stats: LinStatsCollector | None = None
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.layer_idx = layer_idx
         hdim = num_heads * head_dim
         assert hdim == dim, "num_heads * head_dim must equal model_dim"
         std = 0.5 * (dim ** -0.5)
@@ -876,13 +1044,23 @@ class CausalSelfAttention(nn.Module):
                                        causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
             y = y.view(B, T, self.num_heads, self.head_dim)
         elif self.attn_impl == "linear":
+            stats_accum = None
+            if attn_args.lin_stats is not None:
+                stats_accum = LinStatsAccumulator(
+                    eps=1e-6,
+                    sample_size=attn_args.lin_stats.sample_size,
+                    collect_hist=attn_args.lin_stats.collect_hist,
+                )
             y = linear_causal_attention(
                 q[0], k[0], v[0],
                 seqlens=seqlens,
                 attn_scale=attn_scale,
                 window_tokens=bm_size,
                 chunk_size=args.linear_attn_chunk_size,
+                stats_accum=stats_accum,
             ).view(B, T, self.num_heads, self.head_dim)
+            if stats_accum is not None:
+                attn_args.lin_stats.add_layer(self.layer_idx, stats_accum.finalize())
         else:
             raise ValueError(f"Unsupported attn_impl: {self.attn_impl}")
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
@@ -914,7 +1092,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, layer_idx) if layer_idx != 7 else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
 
@@ -998,7 +1176,22 @@ class GPT(nn.Module):
         self.rotary_cos.copy_(theta.cos())
         self.rotary_sin.copy_(theta.sin())
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws: int):
+    def set_angular_freq(self, angular_freq: Tensor):
+        self.angular_freq.copy_(angular_freq)
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        theta = torch.outer(t, self.angular_freq)
+        self.rotary_cos.copy_(theta.cos())
+        self.rotary_sin.copy_(theta.sin())
+
+    def forward(
+        self,
+        input_seq: Tensor,
+        target_seq: Tensor,
+        seqlens: Tensor,
+        ws: int,
+        stats: dict | None = None,
+        lin_stats: LinStatsCollector | None = None,
+    ):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1028,7 +1221,8 @@ class GPT(nn.Module):
                 bm_size=bm_sizes[i],
                 rotary_cos=self.rotary_cos,
                 rotary_sin=self.rotary_sin,
-                attn_scale=self.attn_scales[ws]
+                attn_scale=self.attn_scales[ws],
+                lin_stats=lin_stats,
             )
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
@@ -1040,6 +1234,17 @@ class GPT(nn.Module):
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
+        if stats is not None:
+            logits_fp32 = logits.float()
+            stats["logits_maxabs"] = logits_fp32.abs().max()
+            stats["logits_std"] = logits_fp32.std()
+            sample_tokens = min(logits_fp32.shape[1], stats.get("logits_sample_tokens", 128))
+            logits_sample = logits_fp32[:, :sample_tokens].reshape(-1, logits_fp32.size(-1))
+            if logits_sample.numel() > 0:
+                probs = torch.softmax(logits_sample, dim=-1)
+                stats["entropy"] = -(probs * (probs + 1e-9).log()).sum(dim=-1).mean()
+                if stats.get("collect_hist", False):
+                    stats["logits_samples"] = _sample_tensor(logits_sample, stats.get("hist_sample_size", 10000))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
         return loss
 
@@ -1182,6 +1387,11 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"yarn/{uuid.uuid4()}"
     val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    log_interval: int = 10
+    hist_interval: int = 1000
+    hist_sample_size: int = 10000
+    logits_sample_tokens: int = 128
+    wandb_project: str = "project name"
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1189,7 +1399,37 @@ class Hyperparameters:
     ws_validate: int = 13 # increase final validation ws @classiclarryd
     linear_attn_chunk_size: int = 128
 
+def _parse_env_value(raw: str, default):
+    if isinstance(default, bool):
+        return raw.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+    if isinstance(default, int):
+        return int(raw)
+    if isinstance(default, float):
+        return float(raw)
+    if isinstance(default, tuple):
+        raw = raw.strip()
+        if not raw:
+            return default
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
+            return default
+        elem_type = type(default[0]) if default else int
+        return tuple(elem_type(p) for p in parts)
+    return raw
+
+def apply_env_overrides(args: Hyperparameters):
+    for field in fields(args):
+        env_key = f"HP_{field.name}".upper()
+        if env_key not in os.environ:
+            continue
+        raw = os.environ[env_key]
+        if raw == "":
+            continue
+        default = getattr(args, field.name)
+        setattr(args, field.name, _parse_env_value(raw, default))
+
 args = Hyperparameters()
+apply_env_overrides(args)
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1234,6 +1474,11 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+
+wandb_run = None
+if master_process and WANDB_AVAILABLE:
+    wandb_run = wandb.init(project=args.wandb_project)
+    wandb.config.update({field.name: getattr(args, field.name) for field in fields(args)}, allow_val_change=True)
 
 model: nn.Module = GPT(
     vocab_size=50257,
@@ -1283,7 +1528,48 @@ def get_ws(step: int):
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx]
 
+def get_ws_phase(step: int):
+    if step == args.num_iterations:
+        return args.ws_validate, len(args.ws_schedule)
+    x = step / (1 + args.num_iterations)
+    ws_idx = int(len(args.ws_schedule) * x)
+    return args.ws_schedule[ws_idx], ws_idx
+
+def should_log(step: int):
+    if args.dropsoftmax_step >= 0 and abs(step - args.dropsoftmax_step) <= 200:
+        return True
+    return args.log_interval > 0 and (step % args.log_interval == 0)
+
+def should_log_hist(step: int):
+    if args.dropsoftmax_step >= 0:
+        for offset in (-20, 20, 100, 500):
+            if step == args.dropsoftmax_step + offset:
+                return True
+    return args.hist_interval > 0 and (step % args.hist_interval == 0)
+
+def compute_grad_norm(params: list[Tensor]):
+    total = 0.0
+    for p in params:
+        if p.grad is None:
+            continue
+        total += p.grad.float().pow(2).sum().item()
+    return math.sqrt(total)
+
+def compute_param_norm(params: list[Tensor]):
+    total = 0.0
+    for p in params:
+        total += p.detach().float().pow(2).sum().item()
+    return math.sqrt(total)
+
+def compute_update_norm(params: list[Tensor], snapshot: list[Tensor]):
+    total = 0.0
+    for p, p_old in zip(params, snapshot):
+        diff = (p.detach() - p_old).float()
+        total += diff.pow(2).sum().item()
+    return math.sqrt(total)
+
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+all_params = list(model.parameters())
 
 ########################################
 #            Warmup kernels            #
@@ -1312,20 +1598,43 @@ del train_loader, initial_state
 
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 training_time_ms = 0
+# validation helper
+def eval_loss(ws_value: int):
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(
+        args.val_files,
+        args.val_batch_size,
+        -1,
+        grad_accum_steps=grad_accum_steps,
+        align_to_bos=False,
+    )
+    val_loss = 0
+    with torch.no_grad():
+        for _ in range(val_steps):
+            inputs, targets, cum_seqlens = next(val_loader)
+            val_loss += model(inputs, targets, cum_seqlens, ws_value)
+    val_loss /= val_steps
+    del val_loader
+    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+    return val_loss
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-ws = get_ws(0)
+ws, ws_phase = get_ws_phase(0)
+current_attn_impl = "softmax"
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    new_ws = get_ws(step)
+    new_ws, new_phase = get_ws_phase(step)
     if new_ws != ws:
         model.apply_yarn(ws, new_ws)
-        ws=new_ws
+        ws = new_ws
+    ws_phase = new_phase
     if args.dropsoftmax_step >= 0 and step == args.dropsoftmax_step:
         model.set_attn_impl(args.dropsoftmax_mode)
+        current_attn_impl = args.dropsoftmax_mode
         print0("=== HARD DROP SOFTMAX NOW ===", console=True)
 
     # --------------- VALIDATION SECTION -----------------
@@ -1334,18 +1643,28 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, ws)
-        val_loss /= val_steps
-        del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        val_loss_ctx = eval_loss(ws)
+        val_loss_long = val_loss_ctx
+        if ws != args.ws_validate:
+            angular_backup = model.angular_freq.clone()
+            model.apply_yarn(ws, args.ws_validate)
+            val_loss_long = eval_loss(args.ws_validate)
+            model.set_angular_freq(angular_backup)
+        if master_process:
+            print0(
+                f"step:{step}/{train_steps} "
+                f"val_loss:{val_loss_ctx:.4f} val_loss_long:{val_loss_long:.4f} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms",
+                console=True,
+            )
+        if master_process and WANDB_AVAILABLE and wandb_run is not None:
+            wandb.log(
+                {
+                    "val/loss_ctx2048": val_loss_ctx.item(),
+                    "val/loss_long": val_loss_long.item(),
+                },
+                step=step,
+            )
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1360,9 +1679,48 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for _ in range(grad_accum_steps):
+    do_log = should_log(step)
+    log_hist = should_log_hist(step)
+    collect_stats = (do_log or log_hist) and master_process and WANDB_AVAILABLE and (wandb_run is not None)
+    stats = None
+    lin_stats = None
+    if collect_stats:
+        stats = {
+            "collect_hist": log_hist,
+            "hist_sample_size": args.hist_sample_size,
+            "logits_sample_tokens": args.logits_sample_tokens,
+        }
+        if current_attn_impl == "linear":
+            lin_stats = LinStatsCollector(sample_size=args.hist_sample_size, collect_hist=log_hist)
+
+    loss_total = torch.zeros((), device=device) if do_log else None
+    for micro_idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws).backward()
+        use_stats = collect_stats and (micro_idx == grad_accum_steps - 1)
+        loss = model(
+            inputs,
+            targets,
+            cum_seqlens,
+            ws,
+            stats=stats if use_stats else None,
+            lin_stats=lin_stats if use_stats else None,
+        )
+        loss.backward()
+        if do_log:
+            loss_total += loss.detach()
+
+    train_loss = None
+    if do_log:
+        train_loss = loss_total / (args.train_batch_size / world_size)
+        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+
+    param_snapshot = None
+    grad_norm = 0.0
+    param_norm = 0.0
+    update_norm = 0.0
+    if do_log and master_process:
+        grad_norm = compute_grad_norm(all_params)
+        param_snapshot = [p.detach().clone() for p in all_params]
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -1373,12 +1731,105 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    if do_log and master_process:
+        update_norm = compute_update_norm(all_params, param_snapshot)
+        param_norm = compute_param_norm(all_params)
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if do_log and master_process and WANDB_AVAILABLE and wandb_run is not None:
+        tokens_processed = (step + 1) * args.train_batch_size
+        tok_per_s = 0.0
+        if approx_training_time_ms > 0:
+            tok_per_s = tokens_processed / (approx_training_time_ms / 1000)
+        steps_since_drop = step - args.dropsoftmax_step if args.dropsoftmax_step >= 0 else -1
+        attn_impl_flag = 1 if current_attn_impl == "linear" else 0
+        window_short = (ws // 2) * args.block_size
+        window_long = ws * args.block_size
+
+        out_logits_maxabs = 0.0
+        out_logits_std = 0.0
+        out_entropy = 0.0
+        if stats is not None:
+            out_logits_maxabs = stats.get("logits_maxabs", torch.tensor(0.0)).item()
+            out_logits_std = stats.get("logits_std", torch.tensor(0.0)).item()
+            out_entropy = stats.get("entropy", torch.tensor(0.0)).item()
+
+        lin_metrics = {
+            "den_min": 0.0,
+            "den_p01": 0.0,
+            "den_mean": 0.0,
+            "den_clamp_frac": 0.0,
+            "S_norm_max": 0.0,
+            "Z_norm_max": 0.0,
+            "y_norm_max": 0.0,
+            "nan_inf_count": 0.0,
+        }
+        lin_den_samples = None
+        lin_y_norm_samples = None
+        if lin_stats is not None:
+            lin_agg = lin_stats.aggregate()
+            lin_metrics = {
+                "den_min": lin_agg["den_min"],
+                "den_p01": lin_agg["den_p01"],
+                "den_mean": lin_agg["den_mean"],
+                "den_clamp_frac": lin_agg["den_clamp_frac"],
+                "S_norm_max": lin_agg["S_norm_max"],
+                "Z_norm_max": lin_agg["Z_norm_max"],
+                "y_norm_max": lin_agg["y_norm_max"],
+                "nan_inf_count": lin_agg["nan_inf_count"],
+            }
+            lin_den_samples = lin_agg.get("den_samples")
+            lin_y_norm_samples = lin_agg.get("y_norm_samples")
+
+        metrics = {
+            "train/loss": train_loss.item() if train_loss is not None else 0.0,
+            "train/lr": optimizer1.param_groups[0]["lr"],
+            "train/step": step,
+            "train/tokens": tokens_processed,
+            "train/tok_per_s": tok_per_s,
+            "train/grad_norm": grad_norm,
+            "train/param_norm": param_norm,
+            "train/update_norm": update_norm,
+            "drop/attn_impl": attn_impl_flag,
+            "drop/steps_since_drop": steps_since_drop,
+            "drop/drop_step": args.dropsoftmax_step,
+            "sched/window_short": window_short,
+            "sched/window_long": window_long,
+            "sched/yarn_scale": float(model.attn_scales[ws]),
+            "sched/phase_id": ws_phase,
+            "lin/den_min": lin_metrics["den_min"],
+            "lin/den_p01": lin_metrics["den_p01"],
+            "lin/den_mean": lin_metrics["den_mean"],
+            "lin/den_clamp_frac": lin_metrics["den_clamp_frac"],
+            "lin/S_norm_max": lin_metrics["S_norm_max"],
+            "lin/Z_norm_max": lin_metrics["Z_norm_max"],
+            "lin/y_norm_max": lin_metrics["y_norm_max"],
+            "lin/nan_inf_count": lin_metrics["nan_inf_count"],
+            "out/logits_maxabs": out_logits_maxabs,
+            "out/logits_std": out_logits_std,
+            "out/entropy": out_entropy,
+        }
+
+        if abs(steps_since_drop) <= 200 and lin_stats is not None and lin_stats.layer_stats:
+            layer_ids = sorted(lin_stats.layer_stats.keys())
+            picks = [layer_ids[0], layer_ids[len(layer_ids) // 2], layer_ids[-1]]
+            for layer_id in picks:
+                metrics[f"lin_l{layer_id}/den_min"] = lin_stats.layer_stats[layer_id]["den_min"]
+
+        if log_hist and lin_den_samples is not None:
+            metrics["hist/lin_den"] = wandb.Histogram(lin_den_samples.numpy())
+        if log_hist and lin_y_norm_samples is not None:
+            metrics["hist/lin_y_norm"] = wandb.Histogram(lin_y_norm_samples.numpy())
+        if log_hist and stats is not None and stats.get("logits_samples") is not None:
+            metrics["hist/logits"] = wandb.Histogram(stats["logits_samples"].cpu().numpy())
+
+        wandb.log(metrics, step=step)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process and WANDB_AVAILABLE and wandb_run is not None:
+    wandb.finish()
 dist.destroy_process_group()
