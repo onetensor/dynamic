@@ -589,7 +589,7 @@ def _sample_tensor(x: Tensor, max_samples: int):
         return None
     if x_flat.numel() <= max_samples:
         return x_flat.detach()
-    idx = torch.randperm(x_flat.numel(), device=x_flat.device)[:max_samples]
+    idx = torch.randint(0, x_flat.numel(), (max_samples,), device=x_flat.device)
     return x_flat[idx].detach()
 
 class LinStatsAccumulator:
@@ -597,55 +597,60 @@ class LinStatsAccumulator:
         self.eps = eps
         self.sample_size = sample_size
         self.collect_hist = collect_hist
-        self.den_min = float("inf")
-        self.den_sum = 0.0
+        self.den_min: Tensor | None = None
+        self.den_sum: Tensor | None = None
         self.den_count = 0
-        self.den_clamp_count = 0
-        self.S_norm_max = 0.0
-        self.Z_norm_max = 0.0
-        self.y_norm_max = 0.0
-        self.nan_inf_count = 0
+        self.den_clamp_count: Tensor | None = None
+        self.S_norm_max: Tensor | None = None
+        self.Z_norm_max: Tensor | None = None
+        self.y_norm_max: Tensor | None = None
+        self.nan_inf_count: Tensor | None = None
         self.den_samples: list[Tensor] = []
         self.y_norm_samples: list[Tensor] = []
 
     def update(self, den: Tensor, k_sum: Tensor, kv_sum: Tensor, y: Tensor):
-        den_flat = den.reshape(-1)
-        self.den_min = min(self.den_min, den_flat.min().item())
-        self.den_sum += den_flat.sum().item()
-        self.den_count += den_flat.numel()
-        self.den_clamp_count += (den_flat < self.eps).sum().item()
-        self.nan_inf_count += (~torch.isfinite(den_flat)).sum().item()
-        self.nan_inf_count += (~torch.isfinite(y)).sum().item()
+        with torch.no_grad():
+            den_flat = den.detach().reshape(-1)
+            y_detached = y.detach()
+            den_min = den_flat.min()
+            self.den_min = den_min if self.den_min is None else torch.minimum(self.den_min, den_min)
+            den_sum = den_flat.sum(dtype=torch.float32)
+            self.den_sum = den_sum if self.den_sum is None else self.den_sum + den_sum
+            self.den_count += den_flat.numel()
+            den_clamp = (den_flat < self.eps).sum(dtype=torch.float32)
+            self.den_clamp_count = den_clamp if self.den_clamp_count is None else self.den_clamp_count + den_clamp
+            nan_inf = (~torch.isfinite(den_flat)).sum(dtype=torch.float32)
+            nan_inf = nan_inf + (~torch.isfinite(y_detached)).sum(dtype=torch.float32)
+            self.nan_inf_count = nan_inf if self.nan_inf_count is None else self.nan_inf_count + nan_inf
 
-        z_norm = k_sum.float().norm(dim=-1).max().item()
-        s_norm = kv_sum.float().pow(2).sum(dim=(-1, -2)).sqrt().max().item()
-        y_norm = y.float().norm(dim=-1)
-        y_norm_max = y_norm.max().item()
-        self.Z_norm_max = max(self.Z_norm_max, z_norm)
-        self.S_norm_max = max(self.S_norm_max, s_norm)
-        self.y_norm_max = max(self.y_norm_max, y_norm_max)
+            z_norm = k_sum.detach().float().norm(dim=-1).max()
+            s_norm = kv_sum.detach().float().pow(2).sum(dim=(-1, -2)).sqrt().max()
+            y_norm = y_detached.float().norm(dim=-1)
+            y_norm_max = y_norm.max()
+            self.Z_norm_max = z_norm if self.Z_norm_max is None else torch.maximum(self.Z_norm_max, z_norm)
+            self.S_norm_max = s_norm if self.S_norm_max is None else torch.maximum(self.S_norm_max, s_norm)
+            self.y_norm_max = y_norm_max if self.y_norm_max is None else torch.maximum(self.y_norm_max, y_norm_max)
 
-        if self.sample_size > 0:
-            den_sample = _sample_tensor(den_flat, self.sample_size)
-            if den_sample is not None:
-                self.den_samples.append(den_sample.cpu())
-            if self.collect_hist:
+            if self.sample_size > 0 and self.collect_hist:
+                den_sample = _sample_tensor(den_flat, self.sample_size)
+                if den_sample is not None:
+                    self.den_samples.append(den_sample)
                 y_sample = _sample_tensor(y_norm.reshape(-1), self.sample_size)
                 if y_sample is not None:
-                    self.y_norm_samples.append(y_sample.cpu())
+                    self.y_norm_samples.append(y_sample)
 
     def finalize(self):
         den_samples = torch.cat(self.den_samples) if self.den_samples else None
         y_norm_samples = torch.cat(self.y_norm_samples) if self.y_norm_samples else None
         return {
-            "den_min": 0.0 if self.den_count == 0 else self.den_min,
-            "den_sum": self.den_sum,
+            "den_min": 0.0 if self.den_count == 0 or self.den_min is None else self.den_min.item(),
+            "den_sum": 0.0 if self.den_sum is None else self.den_sum.item(),
             "den_count": self.den_count,
-            "den_clamp_count": self.den_clamp_count,
-            "S_norm_max": self.S_norm_max,
-            "Z_norm_max": self.Z_norm_max,
-            "y_norm_max": self.y_norm_max,
-            "nan_inf_count": self.nan_inf_count,
+            "den_clamp_count": 0.0 if self.den_clamp_count is None else self.den_clamp_count.item(),
+            "S_norm_max": 0.0 if self.S_norm_max is None else self.S_norm_max.item(),
+            "Z_norm_max": 0.0 if self.Z_norm_max is None else self.Z_norm_max.item(),
+            "y_norm_max": 0.0 if self.y_norm_max is None else self.y_norm_max.item(),
+            "nan_inf_count": 0.0 if self.nan_inf_count is None else self.nan_inf_count.item(),
             "den_samples": den_samples,
             "y_norm_samples": y_norm_samples,
         }
@@ -672,7 +677,7 @@ class LinStatsCollector:
             return None
         merged = torch.cat(samples)
         if merged.numel() > self.sample_size:
-            idx = torch.randperm(merged.numel())[: self.sample_size]
+            idx = torch.randperm(merged.numel(), device=merged.device)[: self.sample_size]
             merged = merged[idx]
         return merged
 
@@ -882,9 +887,8 @@ def _linear_attention_chunked_window(
         k_prev = k_cum[os_minus1]
         kv_prev = kv_cum[os_minus1]
         os_is_zero = os == 0
-        if os_is_zero.any():
-            k_prev = k_prev * (~os_is_zero).view(-1, 1, 1)
-            kv_prev = kv_prev * (~os_is_zero).view(-1, 1, 1, 1)
+        k_prev = k_prev * (~os_is_zero).view(-1, 1, 1)
+        kv_prev = kv_prev * (~os_is_zero).view(-1, 1, 1, 1)
         sum_k_same = k_cum - k_prev
         sum_kv_same = kv_cum - kv_prev
 
@@ -894,13 +898,16 @@ def _linear_attention_chunked_window(
         partial_k = torch.zeros_like(sum_k_same)
         partial_kv = torch.zeros_like(sum_kv_same)
         if c > 0:
-            unique_cs = torch.unique(cs)
-            for u in unique_cs.tolist():
+            cs_start = max(s - window_tokens + 1, 0) // chunk_size
+            cs_end = max(e - window_tokens, 0) // chunk_size
+            if cs_start == cs_end:
+                u_values = (cs_start,)
+            else:
+                u_values = (cs_start, cs_end)
+            for u in u_values:
                 if u >= c:
                     continue
                 mask_u = cs == u
-                if not mask_u.any():
-                    continue
                 us = u * chunk_size
                 ue = min(us + chunk_size, total_len)
                 k_u = k[us:ue]
@@ -915,9 +922,8 @@ def _linear_attention_chunked_window(
                 k_u_prev = k_u_cum[os_u_minus1]
                 kv_u_prev = kv_u_cum[os_u_minus1]
                 os_u_zero = os_u == 0
-                if os_u_zero.any():
-                    k_u_prev = k_u_prev * (~os_u_zero).view(-1, 1, 1)
-                    kv_u_prev = kv_u_prev * (~os_u_zero).view(-1, 1, 1, 1)
+                k_u_prev = k_u_prev * (~os_u_zero).view(-1, 1, 1)
+                kv_u_prev = kv_u_prev * (~os_u_zero).view(-1, 1, 1, 1)
                 k_chunk_sum = k_prefix[u + 1] - k_prefix[u]
                 kv_chunk_sum = kv_prefix[u + 1] - kv_prefix[u]
                 partial_k[mask_u] = k_chunk_sum - k_u_prev
@@ -1833,9 +1839,9 @@ for step in range(train_steps + 1):
                 metrics[f"lin_l{layer_id}/den_min"] = lin_stats.layer_stats[layer_id]["den_min"]
 
         if log_hist and lin_den_samples is not None:
-            metrics["hist/lin_den"] = wandb.Histogram(lin_den_samples.numpy())
+            metrics["hist/lin_den"] = wandb.Histogram(lin_den_samples.cpu().numpy())
         if log_hist and lin_y_norm_samples is not None:
-            metrics["hist/lin_y_norm"] = wandb.Histogram(lin_y_norm_samples.numpy())
+            metrics["hist/lin_y_norm"] = wandb.Histogram(lin_y_norm_samples.cpu().numpy())
         if log_hist and stats is not None and stats.get("logits_samples") is not None:
             metrics["hist/logits"] = wandb.Histogram(stats["logits_samples"].cpu().numpy())
 
