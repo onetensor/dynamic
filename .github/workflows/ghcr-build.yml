@@ -1,0 +1,65 @@
+name: Build & Push Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag suffix (e.g. latest, exp)"
+        required: false
+        default: "latest"
+      torch_index_url:
+        description: "Optional TORCH_INDEX_URL override"
+        required: false
+        default: "https://download.pytorch.org/whl/nightly/cu126"
+      torch_version:
+        description: "Optional TORCH_VERSION override (leave blank for latest nightly)"
+        required: false
+        default: ""
+  push: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show files (debug)
+        run: |
+          echo "Workspace contents:"
+          ls -R
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+          df -h
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          provenance: false
+          build-args: |
+            TORCH_INDEX_URL=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.torch_index_url || 'https://download.pytorch.org/whl/nightly/cu126' }}
+            TORCH_VERSION=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.torch_version || '' }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || 'latest' }}

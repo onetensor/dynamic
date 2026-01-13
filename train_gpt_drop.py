@@ -567,6 +567,254 @@ def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
+def _segment_positions(seqlens: Tensor, total_len: int):
+    seqlens = seqlens.to(dtype=torch.int64)
+    positions = torch.arange(total_len, device=seqlens.device, dtype=torch.int64)
+    segment_id = torch.bucketize(positions, seqlens[1:], right=False)
+    segment_start = seqlens[segment_id]
+    return positions, segment_start
+
+def _segment_cumsum(
+    x: Tensor,
+    positions: Tensor,
+    segment_start: Tensor,
+    *,
+    window_tokens: int | None = None,
+):
+    x_cum = torch.cumsum(x, dim=0, dtype=torch.float32)
+    zero = x_cum.new_zeros((1,) + x_cum.shape[1:])
+    x_cum_pad = torch.cat([zero, x_cum], dim=0)
+    offsets = x_cum_pad[segment_start]
+    x_cum -= offsets
+    if window_tokens is not None:
+        shift_pos = positions - segment_start - (window_tokens + 1)
+        mask = shift_pos >= 0
+        shift_idx = torch.where(mask, segment_start + shift_pos, torch.zeros_like(shift_pos))
+        shifted = x_cum[shift_idx]
+        if x_cum.ndim > 1:
+            mask = mask.view(-1, *([1] * (x_cum.ndim - 1)))
+        shifted = shifted * mask
+        x_cum -= shifted
+    return x_cum
+
+def _linear_causal_attention_full(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    seqlens: Tensor,
+    attn_scale: float,
+    window_tokens: int | None = None,
+    eps: float = 1e-6,
+):
+    positions, segment_start = _segment_positions(seqlens, q.size(0))
+    q = q * attn_scale
+    q = F.elu(q) + 1
+    k = F.elu(k) + 1
+    q_fp32 = q.float()
+    k_cum = _segment_cumsum(k, positions, segment_start, window_tokens=window_tokens)
+    kv = torch.einsum("thd,thm->thdm", k, v)
+    kv_cum = _segment_cumsum(kv, positions, segment_start, window_tokens=window_tokens)
+    num = torch.einsum("thd,thdm->thm", q_fp32, kv_cum)
+    den = torch.einsum("thd,thd->th", q_fp32, k_cum).unsqueeze(-1)
+    return (num / den.clamp_min(eps)).to(dtype=q.dtype)
+
+def _iter_segments(seqlens: Tensor, total_len: int):
+    seqlens = seqlens.to(dtype=torch.int64)
+    if seqlens.is_cuda:
+        seqlens = seqlens.cpu()
+    bounds = seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if start >= total_len:
+            break
+        if end <= start:
+            continue
+        if end > total_len:
+            end = total_len
+        yield start, end
+
+def _linear_attention_chunked_no_window(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    attn_scale: float,
+    chunk_size: int,
+    eps: float,
+):
+    out = torch.empty_like(v)
+    k_prefix = torch.zeros((q.size(1), q.size(2)), dtype=torch.float32, device=q.device)
+    kv_prefix = torch.zeros((q.size(1), q.size(2), v.size(2)), dtype=torch.float32, device=q.device)
+    for s in range(0, q.size(0), chunk_size):
+        e = min(s + chunk_size, q.size(0))
+        q_chunk = q[s:e] * attn_scale
+        k_chunk = k[s:e]
+        v_chunk = v[s:e]
+        q_feat = F.elu(q_chunk) + 1
+        k_feat = F.elu(k_chunk) + 1
+        q_fp32 = q_feat.float()
+        k_cum = torch.cumsum(k_feat, dim=0, dtype=torch.float32) + k_prefix
+        kv = torch.einsum("thd,thm->thdm", k_feat, v_chunk)
+        kv_cum = torch.cumsum(kv, dim=0, dtype=torch.float32) + kv_prefix
+        num = torch.einsum("thd,thdm->thm", q_fp32, kv_cum)
+        den = torch.einsum("thd,thd->th", q_fp32, k_cum).unsqueeze(-1)
+        out[s:e] = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+        k_prefix = k_cum[-1]
+        kv_prefix = kv_cum[-1]
+    return out
+
+def _linear_attention_chunked_window(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    attn_scale: float,
+    window_tokens: int,
+    chunk_size: int,
+    eps: float,
+):
+    total_len = q.size(0)
+    num_chunks = (total_len + chunk_size - 1) // chunk_size
+    # Prefix sums over chunks to avoid full-length kv_cum.
+    k_prefix = torch.zeros((num_chunks + 1, q.size(1), q.size(2)), dtype=torch.float32, device=q.device)
+    kv_prefix = torch.zeros((num_chunks + 1, q.size(1), q.size(2), v.size(2)), dtype=torch.float32, device=q.device)
+    for c in range(num_chunks):
+        s = c * chunk_size
+        e = min(s + chunk_size, total_len)
+        k_chunk = k[s:e]
+        v_chunk = v[s:e]
+        k_feat = F.elu(k_chunk) + 1
+        k_sum = k_feat.sum(dim=0, dtype=torch.float32)
+        kv_sum = torch.einsum("thd,thm->hdm", k_feat, v_chunk).to(dtype=torch.float32)
+        k_prefix[c + 1] = k_prefix[c] + k_sum
+        kv_prefix[c + 1] = kv_prefix[c] + kv_sum
+
+    out = torch.empty_like(v)
+    idx_base = torch.arange(chunk_size, device=q.device)
+    for c in range(num_chunks):
+        s = c * chunk_size
+        e = min(s + chunk_size, total_len)
+        lc = e - s
+        idx = idx_base[:lc] + s
+        s_idx = idx - window_tokens + 1
+        s_idx = torch.clamp(s_idx, min=0)
+        cs = torch.div(s_idx, chunk_size, rounding_mode="floor")
+        os = s_idx - cs * chunk_size
+
+        q_chunk = q[s:e] * attn_scale
+        k_chunk = k[s:e]
+        v_chunk = v[s:e]
+        q_feat = F.elu(q_chunk) + 1
+        k_feat = F.elu(k_chunk) + 1
+        q_fp32 = q_feat.float()
+        k_cum = torch.cumsum(k_feat, dim=0, dtype=torch.float32)
+        kv = torch.einsum("thd,thm->thdm", k_feat, v_chunk)
+        kv_cum = torch.cumsum(kv, dim=0, dtype=torch.float32)
+
+        os_minus1 = (os - 1).clamp(min=0)
+        k_prev = k_cum[os_minus1]
+        kv_prev = kv_cum[os_minus1]
+        os_is_zero = os == 0
+        if os_is_zero.any():
+            k_prev = k_prev * (~os_is_zero).view(-1, 1, 1)
+            kv_prev = kv_prev * (~os_is_zero).view(-1, 1, 1, 1)
+        sum_k_same = k_cum - k_prev
+        sum_kv_same = kv_cum - kv_prev
+
+        k_full = k_prefix[c] - k_prefix[cs + 1]
+        kv_full = kv_prefix[c] - kv_prefix[cs + 1]
+
+        partial_k = torch.zeros_like(sum_k_same)
+        partial_kv = torch.zeros_like(sum_kv_same)
+        if c > 0:
+            unique_cs = torch.unique(cs)
+            for u in unique_cs.tolist():
+                if u >= c:
+                    continue
+                mask_u = cs == u
+                if not mask_u.any():
+                    continue
+                us = u * chunk_size
+                ue = min(us + chunk_size, total_len)
+                k_u = k[us:ue]
+                v_u = v[us:ue]
+                k_u_feat = F.elu(k_u) + 1
+                k_u_cum = torch.cumsum(k_u_feat, dim=0, dtype=torch.float32)
+                kv_u = torch.einsum("thd,thm->thdm", k_u_feat, v_u)
+                kv_u_cum = torch.cumsum(kv_u, dim=0, dtype=torch.float32)
+
+                os_u = os[mask_u]
+                os_u_minus1 = (os_u - 1).clamp(min=0)
+                k_u_prev = k_u_cum[os_u_minus1]
+                kv_u_prev = kv_u_cum[os_u_minus1]
+                os_u_zero = os_u == 0
+                if os_u_zero.any():
+                    k_u_prev = k_u_prev * (~os_u_zero).view(-1, 1, 1)
+                    kv_u_prev = kv_u_prev * (~os_u_zero).view(-1, 1, 1, 1)
+                k_chunk_sum = k_prefix[u + 1] - k_prefix[u]
+                kv_chunk_sum = kv_prefix[u + 1] - kv_prefix[u]
+                partial_k[mask_u] = k_chunk_sum - k_u_prev
+                partial_kv[mask_u] = kv_chunk_sum - kv_u_prev
+
+        sum_k_other = k_cum + k_full + partial_k
+        sum_kv_other = kv_cum + kv_full + partial_kv
+
+        same_mask = cs == c
+        sum_k = torch.where(same_mask.view(-1, 1, 1), sum_k_same, sum_k_other)
+        sum_kv = torch.where(same_mask.view(-1, 1, 1, 1), sum_kv_same, sum_kv_other)
+
+        num = torch.einsum("thd,thdm->thm", q_fp32, sum_kv)
+        den = torch.einsum("thd,thd->th", q_fp32, sum_k).unsqueeze(-1)
+        out[s:e] = (num / den.clamp_min(eps)).to(dtype=q.dtype)
+    return out
+
+def linear_causal_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    seqlens: Tensor,
+    attn_scale: float,
+    window_tokens: int | None = None,
+    eps: float = 1e-6,
+    chunk_size: int | None = None,
+):
+    if chunk_size is None or chunk_size <= 0:
+        return _linear_causal_attention_full(
+            q,
+            k,
+            v,
+            seqlens=seqlens,
+            attn_scale=attn_scale,
+            window_tokens=window_tokens,
+            eps=eps,
+        )
+    out = torch.empty_like(v)
+    for start, end in _iter_segments(seqlens, q.size(0)):
+        q_seg = q[start:end]
+        k_seg = k[start:end]
+        v_seg = v[start:end]
+        if window_tokens is None:
+            out[start:end] = _linear_attention_chunked_no_window(
+                q_seg,
+                k_seg,
+                v_seg,
+                attn_scale=attn_scale,
+                chunk_size=chunk_size,
+                eps=eps,
+            )
+        else:
+            out[start:end] = _linear_attention_chunked_window(
+                q_seg,
+                k_seg,
+                v_seg,
+                attn_scale=attn_scale,
+                window_tokens=window_tokens,
+                chunk_size=chunk_size,
+                eps=eps,
+            )
+    return out
+
 @dataclass
 class AttnArgs:
     ve: torch.Tensor
@@ -596,6 +844,12 @@ class CausalSelfAttention(nn.Module):
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
         self.attn_gate.weight.detach().zero_()
+        self.attn_impl = "softmax"
+
+    def set_attn_impl(self, attn_impl: str):
+        if attn_impl not in ("softmax", "linear"):
+            raise ValueError(f"Unsupported attn_impl: {attn_impl}")
+        self.attn_impl = attn_impl
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -614,12 +868,23 @@ class CausalSelfAttention(nn.Module):
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = sa_lambdas[0] * v
 
-        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
-
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                   causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
+        if self.attn_impl == "softmax":
+            max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+            # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
+            y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                       max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                       causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
+        elif self.attn_impl == "linear":
+            y = linear_causal_attention(
+                q[0], k[0], v[0],
+                seqlens=seqlens,
+                attn_scale=attn_scale,
+                window_tokens=bm_size,
+                chunk_size=args.linear_attn_chunk_size,
+            ).view(B, T, self.num_heads, self.head_dim)
+        else:
+            raise ValueError(f"Unsupported attn_impl: {self.attn_impl}")
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, self.qkvo_w[3].type_as(y))
@@ -717,6 +982,11 @@ class GPT(nn.Module):
         # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         attn_scales = list(accumulate([0.1] + scale_factors, lambda acc, factor: acc * factor))
         self.attn_scales = dict(zip(windows, attn_scales))
+
+    def set_attn_impl(self, attn_impl: str):
+        for block in self.blocks:
+            if block.attn is not None:
+                block.attn.set_attn_impl(attn_impl)
 
     def apply_yarn(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
         rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
@@ -907,6 +1177,8 @@ class Hyperparameters:
     # optimization
     num_iterations: int = 1670 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
+    dropsoftmax_step: int = -1 # global step to hard-switch attention; -1 disables
+    dropsoftmax_mode: str = "linear"
     # evaluation and logging
     run_id: str = f"yarn/{uuid.uuid4()}"
     val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -915,6 +1187,7 @@ class Hyperparameters:
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws @classiclarryd
+    linear_attn_chunk_size: int = 128
 
 args = Hyperparameters()
 
@@ -1051,6 +1324,9 @@ for step in range(train_steps + 1):
     if new_ws != ws:
         model.apply_yarn(ws, new_ws)
         ws=new_ws
+    if args.dropsoftmax_step >= 0 and step == args.dropsoftmax_step:
+        model.set_attn_impl(args.dropsoftmax_mode)
+        print0("=== HARD DROP SOFTMAX NOW ===", console=True)
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
