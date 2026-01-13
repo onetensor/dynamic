@@ -10,11 +10,11 @@ on:
       torch_index_url:
         description: "Optional TORCH_INDEX_URL override"
         required: false
-        default: "https://download.pytorch.org/whl/nightly/cu126"
+        default: "https://download.pytorch.org/whl/cu126"
       torch_version:
-        description: "Optional TORCH_VERSION override (leave blank for latest nightly)"
+        description: "Optional TORCH_VERSION override"
         required: false
-        default: ""
+        default: "2.9.1"  # Changed from empty string
   push: {}
 
 permissions:
@@ -59,7 +59,7 @@ jobs:
           push: true
           provenance: false
           build-args: |
-            TORCH_INDEX_URL=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.torch_index_url || 'https://download.pytorch.org/whl/nightly/cu126' }}
-            TORCH_VERSION=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.torch_version || '' }}
+            TORCH_INDEX_URL=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.torch_index_url || 'https://download.pytorch.org/whl/cu126' }}
+            TORCH_VERSION=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.torch_version || '2.9.1' }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || 'latest' }}
