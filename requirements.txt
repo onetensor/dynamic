@@ -4,3 +4,4 @@ torch
 huggingface-hub
 kernels
 setuptools
+flash-attn

@@ -23,7 +23,15 @@ import torch.distributed as dist
 import numpy as np
 import triton
 import triton.language as tl
-from flash_attn_interface import flash_attn_varlen_func
+try:
+    from flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+    except ImportError as exc:
+        raise ImportError(
+            "flash_attn_varlen_func not found. Install flash-attn or ensure flash_attn_interface is on PYTHONPATH."
+        ) from exc
 import torch._dynamo as dynamo
 dynamo.config.recompile_limit = 64
 try:
