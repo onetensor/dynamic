@@ -32,7 +32,7 @@ RUN grep -vE '^torch($|[<=>])' requirements.txt > /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
 
-RUN pip install packaging
+RUN pip install packaging psutil
 RUN pip install flash-attn --no-build-isolation
 
 COPY . /dynamic
