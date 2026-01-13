@@ -737,6 +737,22 @@ def _segment_positions(seqlens: Tensor, total_len: int):
     segment_start = seqlens[segment_id]
     return positions, segment_start
 
+def _segments_from_seqlens(seqlens: Tensor, total_len: int) -> list[tuple[int, int]]:
+    seqlens = seqlens.to(dtype=torch.int64)
+    if seqlens.is_cuda:
+        seqlens = seqlens.cpu()
+    bounds = seqlens.tolist()
+    segments: list[tuple[int, int]] = []
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if start >= total_len:
+            break
+        if end <= start:
+            continue
+        if end > total_len:
+            end = total_len
+        segments.append((start, end))
+    return segments
+
 def _segment_cumsum(
     x: Tensor,
     positions: Tensor,
@@ -954,6 +970,7 @@ def linear_causal_attention(
     window_tokens: int | None = None,
     eps: float = 1e-6,
     chunk_size: int | None = None,
+    segments: list[tuple[int, int]] | None = None,
     stats_accum: LinStatsAccumulator | None = None,
 ):
     if chunk_size is None or chunk_size <= 0:
@@ -968,7 +985,8 @@ def linear_causal_attention(
             stats_accum=stats_accum,
         )
     out = torch.empty_like(v)
-    for start, end in _iter_segments(seqlens, q.size(0)):
+    segment_iter = segments if segments is not None else _iter_segments(seqlens, q.size(0))
+    for start, end in segment_iter:
         q_seg = q[start:end]
         k_seg = k[start:end]
         v_seg = v[start:end]
@@ -1005,6 +1023,7 @@ class AttnArgs:
     rotary_sin: torch.Tensor
     attn_scale: float
     lin_stats: LinStatsCollector | None = None
+    segments: list[tuple[int, int]] | None = None
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1071,6 +1090,7 @@ class CausalSelfAttention(nn.Module):
                 attn_scale=attn_scale,
                 window_tokens=bm_size,
                 chunk_size=args.linear_attn_chunk_size,
+                segments=attn_args.segments,
                 stats_accum=stats_accum,
             ).view(B, T, self.num_heads, self.head_dim)
             if stats_accum is not None:
@@ -1207,6 +1227,9 @@ class GPT(nn.Module):
         lin_stats: LinStatsCollector | None = None,
     ):
         assert input_seq.ndim == 1
+        segments = None
+        if self.blocks[0].attn_impl == "linear":
+            segments = _segments_from_seqlens(seqlens, input_seq.numel())
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
@@ -1237,6 +1260,7 @@ class GPT(nn.Module):
                 rotary_sin=self.rotary_sin,
                 attn_scale=self.attn_scales[ws],
                 lin_stats=lin_stats,
+                segments=segments,
             )
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
