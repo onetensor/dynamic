@@ -1420,7 +1420,10 @@ class Hyperparameters:
     val_linear_eval_steps: int = 16 # limit eval steps after drop to avoid long stalls; 0 uses full val_tokens
     # optimization
     num_iterations: int = 1670 # number of iterations to run
-    cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
+    cooldown_frac: float = 0.7 # fraction of training spent cooling down the learning rate
+    min_lr_mult: float = 0.05 # minimum LR multiplier at the end of decay
+    adam_lr: float = 0.006
+    muon_lr: float = 0.04
     dropsoftmax_step: int = -1 # global step to hard-switch attention; -1 disables
     dropsoftmax_mode: str = "linear"
     # evaluation and logging
@@ -1542,8 +1545,8 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=args.adam_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+optimizer2 = Muon(hidden_matrix_params, lr=args.muon_lr, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -1556,7 +1559,7 @@ def get_lr(step: int):
     lr = 1.0
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
-        lr = w * 1.0 + (1 - w) * 0.1
+        lr = w * 1.0 + (1 - w) * args.min_lr_mult
     return lr
 
 def get_ws(step: int):
