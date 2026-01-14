@@ -1148,6 +1148,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.attn_impl = "softmax"
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
@@ -1196,6 +1197,7 @@ class GPT(nn.Module):
         self.attn_scales = dict(zip(windows, attn_scales))
 
     def set_attn_impl(self, attn_impl: str):
+        self.attn_impl = attn_impl
         for block in self.blocks:
             if block.attn is not None:
                 block.attn.set_attn_impl(attn_impl)
@@ -1228,7 +1230,7 @@ class GPT(nn.Module):
     ):
         assert input_seq.ndim == 1
         segments = None
-        if self.blocks[0].attn_impl == "linear":
+        if self.attn_impl == "linear":
             segments = _segments_from_seqlens(seqlens, input_seq.numel())
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
